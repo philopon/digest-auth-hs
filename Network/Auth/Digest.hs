@@ -17,10 +17,14 @@ module Network.Auth.Digest
     -- ** state
     , DigestAuth
     , createDigestAuth, createSystemDigestAuth
-    -- * 
+    -- ** encrypto password
     , EncryptedPassword(..)
     , encryptoPassword
+    -- ** header
     , wwwAuthenticate
+    -- ** check
+    , AuthStatus(..)
+    , Reason(..)
     , checkAuth
     ) where
 
@@ -152,13 +156,26 @@ calcResponse (EncryptedPassword a1) method uri nonce nc cnonce qop =
     let a2 = md5Hex $ S.intercalate ":" [method, uri]
     in md5Hex $ S.intercalate ":" [a1, nonce, nc, cnonce, qop, a2]
 
+data AuthStatus
+    = AuthOk User
+    | AuthFailed Reason S.ByteString
+    deriving ( Show, Eq )
+
+data Reason
+    = ParseFailed String -- ^ Authenticate header parse failed.
+    | Staled  User -- ^ nonce-count reused.
+    | Expired User -- ^ nonce-count expired.
+    | NoUser  User -- ^ no user data.
+    | ResponseMismatch User -- ^ response value mismatched.
+    deriving (Show, Eq)
+
 -- | check authenticated.
 --
 -- * Nothing: auth successed.
 -- * Just h: auth failed. you should return response 401 with \"WWW-Authenticate: h\" header.
-checkAuth :: (MonadIO m, MonadPlus m) => DigestAuth m -> Method -> S.ByteString -> m (Maybe S.ByteString)
+checkAuth :: (MonadIO m, MonadPlus m) => DigestAuth m -> Method -> S.ByteString -> m AuthStatus
 checkAuth digest@(DigestAuth cfg _ store) method hdr = case A.parseOnly authorizationP hdr of
-    Left _     -> liftIO $ Just <$> wwwAuthenticate digest
+    Left r     -> liftIO $ AuthFailed (ParseFailed r) <$> wwwAuthenticate digest
     Right auth -> do
         resp     <- maybe mzero return $ lookup "response" auth
         user     <- maybe mzero return $ lookup "username" auth
@@ -170,18 +187,17 @@ checkAuth digest@(DigestAuth cfg _ store) method hdr = case A.parseOnly authoriz
             Just (r, "") -> return (s,r)
             _            -> mzero) $ lookup "nc" auth
         ncState  <- liftIO . atomically $ STMMap.focus (checkNc nci) nonce store
-        crypto   <- digestAuthCryptoPassword cfg user
         case ncState of
-            True  -> liftIO $ Just <$> wwwAuthenticate' True digest
-            False -> case crypto of
-                Nothing -> liftIO $ Just <$> wwwAuthenticate digest
+            Just rf -> liftIO $ AuthFailed (rf user) <$> wwwAuthenticate' True digest
+            Nothing -> digestAuthCryptoPassword cfg user >>= \case
+                Nothing -> liftIO $ AuthFailed (NoUser user) <$> wwwAuthenticate digest
                 Just cp -> do
                     let resp' = calcResponse cp method uri nonce nc cnonce qop
                     if resp == resp'
-                        then return Nothing
-                        else liftIO $ Just <$> wwwAuthenticate digest
+                        then return $ AuthOk user
+                        else liftIO $ AuthFailed (ResponseMismatch user) <$> wwwAuthenticate digest
   where
-    checkNc _  Nothing  = return (True, Focus.Keep)
+    checkNc _  Nothing  = return (Just Expired, Focus.Keep)
     checkNc nc (Just s) = STMSet.lookup nc s >>= \case
-        False -> STMSet.insert nc s >> return (False, Focus.Keep)
-        True  -> return (True, Focus.Remove)
+        False -> STMSet.insert nc s >> return (Nothing, Focus.Keep)
+        True  -> return (Just Staled, Focus.Remove)
